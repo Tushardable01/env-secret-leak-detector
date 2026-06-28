@@ -1,51 +1,81 @@
-const express = require('express');
-const path = require('path');
-const router = express.Router();
-const { scanRepo } = require('../scanner/gitWalker');
-const ScanResult = require('../models/ScanResult');
+const express  = require('express');
+const path     = require('path');
+const fs       = require('fs');
+const os       = require('os');
+const router   = express.Router();
+const simpleGit = require('simple-git');
+const { scanRepo }    = require('../scanner/gitWalker');
+const ScanResult      = require('../models/ScanResult');
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/scan
-// Body: { repoPath: "/absolute/path/to/your/repo" }
-// Creates a scan record, runs the scanner asynchronously, returns scanId
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+function isGitHubUrl(input) {
+  return /^https?:\/\/(www\.)?github\.com\/.+\/.+/i.test(input.trim());
+}
+
+function repoNameFromUrl(url) {
+  // "https://github.com/user/repo.git" → "repo"
+  return url.trim().replace(/\.git$/, '').split('/').pop();
+}
+
+async function cloneRepo(githubUrl, destPath) {
+  const git = simpleGit();
+  await git.clone(githubUrl.trim(), destPath, ['--depth', '50']);
+}
+
+function deleteDir(dirPath) {
+  try {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+  } catch (_) {}
+}
+
+// ── POST /api/scan ────────────────────────────────────────────────────────────
+// Accepts either:
+//   { repoPath: "/local/path" }          ← local mode (CLI / local UI)
+//   { githubUrl: "https://github.com/…" } ← remote mode (live website)
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/scan', async (req, res) => {
-  const { repoPath } = req.body;
+  const { repoPath, githubUrl } = req.body;
 
-  if (!repoPath) {
-    return res.status(400).json({ error: 'repoPath is required' });
+  // Auto-detect: if user pasted a GitHub URL into the repoPath field
+  const rawInput   = githubUrl || repoPath || '';
+  const isRemote   = githubUrl || isGitHubUrl(rawInput);
+
+  if (!rawInput) {
+    return res.status(400).json({ error: 'Provide a repoPath or githubUrl' });
   }
 
-  // Derive a friendly repo name from the path
-  const repoName = path.basename(repoPath);
+  const repoName = isRemote
+    ? repoNameFromUrl(rawInput)
+    : path.basename(rawInput);
 
-  // Create the scan record immediately (status: running)
+  // Create scan record immediately
   const scanRecord = await ScanResult.create({
-    repoPath,
+    repoPath: rawInput,
     repoName,
     status: 'running',
   });
 
-  // Respond immediately with the scanId so the frontend can start polling
   res.json({ scanId: scanRecord._id, message: 'Scan started' });
 
-  // Run the scan in the background (don't await here)
-  runScanInBackground(scanRecord._id, repoPath);
+  // Run in background
+  if (isRemote) {
+    runRemoteScan(scanRecord._id, rawInput, repoName);
+  } else {
+    runLocalScan(scanRecord._id, rawInput);
+  }
 });
 
-async function runScanInBackground(scanId, repoPath) {
+// ── Local scan (unchanged behaviour) ─────────────────────────────────────────
+async function runLocalScan(scanId, repoPath) {
   try {
     const { findings, totalCommitsScanned } = await scanRepo(repoPath);
-
     await ScanResult.findByIdAndUpdate(scanId, {
       status: 'done',
       findings,
       totalCommitsScanned,
     });
-
-    console.log(`Scan ${scanId} complete — ${findings.length} findings in ${totalCommitsScanned} commits`);
   } catch (err) {
-    console.error(`Scan ${scanId} failed:`, err.message);
     await ScanResult.findByIdAndUpdate(scanId, {
       status: 'error',
       errorMessage: err.message,
@@ -53,27 +83,47 @@ async function runScanInBackground(scanId, repoPath) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/results/:scanId
-// Returns the scan result (findings + summary)
-// Frontend polls this until status === 'done'
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Remote scan (clone → scan → delete) ──────────────────────────────────────
+async function runRemoteScan(scanId, githubUrl, repoName) {
+  // Clone into a unique temp directory so parallel scans don't collide
+  const tmpDir = path.join(os.tmpdir(), `env-leak-${scanId}`);
+
+  try {
+    // 1. Clone (shallow — last 50 commits keeps things fast)
+    await cloneRepo(githubUrl, tmpDir);
+
+    // 2. Scan the cloned repo
+    const { findings, totalCommitsScanned } = await scanRepo(tmpDir);
+
+    // 3. Save results
+    await ScanResult.findByIdAndUpdate(scanId, {
+      status: 'done',
+      findings,
+      totalCommitsScanned,
+    });
+  } catch (err) {
+    await ScanResult.findByIdAndUpdate(scanId, {
+      status: 'error',
+      errorMessage: `Clone/scan failed: ${err.message}`,
+    });
+  } finally {
+    // 4. Always delete the temp clone
+    deleteDir(tmpDir);
+  }
+}
+
+// ── GET /api/results/:scanId ──────────────────────────────────────────────────
 router.get('/results/:scanId', async (req, res) => {
   try {
     const result = await ScanResult.findById(req.params.scanId);
-    if (!result) {
-      return res.status(404).json({ error: 'Scan not found' });
-    }
+    if (!result) return res.status(404).json({ error: 'Scan not found' });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/scans
-// Returns list of all past scans (for history page)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── GET /api/scans ────────────────────────────────────────────────────────────
 router.get('/scans', async (req, res) => {
   try {
     const scans = await ScanResult.find()
@@ -81,7 +131,6 @@ router.get('/scans', async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(20);
 
-    // Return with summary counts
     const scansWithSummary = scans.map((s) => ({
       _id: s._id,
       repoName: s.repoName,
@@ -99,10 +148,7 @@ router.get('/scans', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DELETE /api/scans/:scanId
-// Deletes a scan record
-// ─────────────────────────────────────────────────────────────────────────────
+// ── DELETE /api/scans/:scanId ─────────────────────────────────────────────────
 router.delete('/scans/:scanId', async (req, res) => {
   try {
     await ScanResult.findByIdAndDelete(req.params.scanId);
