@@ -1,5 +1,5 @@
 {
-  "name": "env-leak-detector",
+  "name": "env-secret-leak-detector",
   "version": "1.0.0",
   "description": "Scan git history for accidentally committed secrets and API keys",
   "main": "src/server.js",
@@ -11,9 +11,13 @@
     "dev": "nodemon src/server.js",
     "cli": "node src/cli.js"
   },
-  "keywords": ["security", "git", "secrets", "api-keys", "env", "leak", "scanner"],
-  "author": "Tushar",
+  "author": "Tushar Dable",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tushardable01/env-secret-leak-detector"
+  },
+  "keywords": ["security", "git", "secrets", "api-keys", "env", "leak", "scanner"],
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
