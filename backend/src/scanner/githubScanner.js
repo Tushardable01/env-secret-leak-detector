@@ -1,17 +1,15 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// githubScanner.js
-// Uses GitHub API to fetch repo contents + commits without needing git CLI
-// ─────────────────────────────────────────────────────────────────────────────
-
 const https = require('https');
 
-// ── HTTP helper ───────────────────────────────────────────────────────────────
 function httpGet(url, headers = {}) {
   return new Promise((resolve, reject) => {
     const opts = {
       headers: {
         'User-Agent': 'env-secret-leak-detector',
         'Accept': 'application/vnd.github.v3+json',
+        // Use token if available — increases limit from 60 to 5000 requests/hour
+        ...(process.env.GITHUB_TOKEN && {
+          'Authorization': `token ${process.env.GITHUB_TOKEN}`
+        }),
         ...headers,
       },
     };
@@ -23,7 +21,9 @@ function httpGet(url, headers = {}) {
         let data = '';
         res.on('data', chunk => data += chunk);
         res.on('end', () => {
-          if (res.statusCode >= 400) {
+          if (res.statusCode === 403) {
+            reject(new Error('GitHub API rate limit exceeded. Try again in an hour.'));
+          } else if (res.statusCode >= 400) {
             reject(new Error(`GitHub API error ${res.statusCode}: ${data}`));
           } else {
             try { resolve(JSON.parse(data)); }
@@ -36,41 +36,35 @@ function httpGet(url, headers = {}) {
   });
 }
 
-// ── Parse GitHub URL ──────────────────────────────────────────────────────────
 function parseGitHubUrl(url) {
   const clean = url.trim().replace(/\.git$/, '').replace(/\/$/, '');
   const match = clean.match(/github\.com\/([^\/]+)\/([^\/]+)/);
-  if (!match) throw new Error('Invalid GitHub URL');
+  if (!match) throw new Error('Invalid GitHub URL — use format: https://github.com/user/repo');
   return { owner: match[1], repo: match[2] };
 }
 
-// ── Get all commits (up to 100) ───────────────────────────────────────────────
 async function getCommits(owner, repo) {
   const url = `https://api.github.com/repos/${owner}/${repo}/commits?per_page=100`;
   return await httpGet(url);
 }
 
-// ── Get diff for a single commit ──────────────────────────────────────────────
 async function getCommitDiff(owner, repo, sha) {
   const url = `https://api.github.com/repos/${owner}/${repo}/commits/${sha}`;
   const data = await httpGet(url, { 'Accept': 'application/vnd.github.v3.diff' });
   return typeof data === 'string' ? data : JSON.stringify(data);
 }
 
-// ── Main scanner function ─────────────────────────────────────────────────────
 async function scanGitHubRepo(githubUrl, matchPatternsFn) {
   const { owner, repo } = parseGitHubUrl(githubUrl);
 
-  // Get commits
   const commits = await getCommits(owner, repo);
   if (!Array.isArray(commits)) {
-    throw new Error('Could not fetch commits. Repo may be private or not exist.');
+    throw new Error('Could not fetch commits. Repo may be private or does not exist.');
   }
 
   const allFindings = [];
   const seen = new Set();
 
-  // Scan each commit's diff
   for (const commit of commits) {
     try {
       const diff = await getCommitDiff(owner, repo, commit.sha);
@@ -81,7 +75,6 @@ async function scanGitHubRepo(githubUrl, matchPatternsFn) {
         commit.commit?.author?.name || 'unknown'
       );
 
-      // Deduplicate
       for (const f of findings) {
         const key = `${f.type}:${f.preview}:${f.commitHash}`;
         if (!seen.has(key)) {
@@ -90,12 +83,11 @@ async function scanGitHubRepo(githubUrl, matchPatternsFn) {
         }
       }
     } catch (err) {
-      // Skip commits that fail
       console.warn(`Skipping commit ${commit.sha}: ${err.message}`);
     }
 
-    // Small delay to avoid GitHub rate limiting
-    await new Promise(r => setTimeout(r, 100));
+    // Small delay to be respectful to GitHub API
+    await new Promise(r => setTimeout(r, 50));
   }
 
   return {
